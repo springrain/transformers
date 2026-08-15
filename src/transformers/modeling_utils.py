@@ -4326,6 +4326,23 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         )
         loading_info, disk_offload_index = cls._load_pretrained_model(model, state_dict, checkpoint_files, load_config)
         loading_info = cls._finalize_model_loading(model, load_config, loading_info)
+
+        # If KTransformers skips expert weight loading, wrap MoE layers before eval() so the returned model is already
+        # KTransformers-wrapped.
+        from .integrations.kt import (
+            set_kt_checkpoint_metadata,
+            should_skip_kt_expert_loading,
+            wrap_model_with_kt_kernel,
+        )
+
+        if should_skip_kt_expert_loading():
+            kt_config = set_kt_checkpoint_metadata(
+                checkpoint_files=checkpoint_files, sharded_metadata=sharded_metadata
+            )
+            if kt_config is not None:
+                wrappers = wrap_model_with_kt_kernel(model, kt_config)
+                logger.info(f"Wrapped {len(wrappers)} MoE layers with KTransformers in from_pretrained.")
+
         model.eval()  # Set model in evaluation mode to deactivate Dropout modules by default
         model.set_use_kernels(use_kernels, kernel_config)
 
@@ -4454,6 +4471,18 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
             else:
                 raise ValueError("Neither a state dict nor checkpoint files were found.")
 
+            # Stash checkpoint_files on kt_config so the KTransformers wrapper can access them, and filter expert
+            # keys from the state dict because the KTransformers kernel loads them directly.
+            from .integrations.kt import (
+                filter_kt_expert_state_dict,
+                set_kt_checkpoint_metadata,
+                should_skip_kt_expert_loading,
+            )
+
+            if should_skip_kt_expert_loading():
+                set_kt_checkpoint_metadata(checkpoint_files=checkpoint_files)
+                merged_state_dict = filter_kt_expert_state_dict(merged_state_dict)
+
             loading_info, disk_offload_index = convert_and_load_state_dict_in_model(
                 model=model,
                 state_dict=merged_state_dict,
@@ -4475,6 +4504,12 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         """Perform all post processing operations after having loaded some checkpoints into a model, such as moving
         missing keys from meta device to their expected device, reinitializing missing weights according to proper
         distributions, tying the weights and logging the loading report."""
+        # Filter KTransformers expert keys from missing_keys and replace meta params with CPU placeholders.
+        from .integrations.kt import move_kt_missing_keys_to_cpu, should_skip_kt_expert_loading
+
+        if should_skip_kt_expert_loading():
+            move_kt_missing_keys_to_cpu(model, loading_info.missing_keys)
+
         try:
             # Marks tied weights as `_is_hf_initialized` to avoid initializing them (it's very important for efficiency)
             model.mark_tied_weights_as_initialized(loading_info)
@@ -4760,7 +4795,12 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
 
         # In this case we need to move everything back
         if is_fsdp_enabled() and not is_local_dist_rank_0() and not is_quantized:
+            from .integrations.kt import is_kt_expert_key, should_skip_kt_expert_loading
+
+            skip_kt_experts = should_skip_kt_expert_loading()
             for key, param in self.named_parameters():
+                if skip_kt_experts and is_kt_expert_key(key):
+                    continue
                 value = torch.zeros_like(param, device="cpu")
                 _load_parameter_into_model(self, key, value)
             for key, buffer in self.named_buffers():
