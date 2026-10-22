@@ -126,7 +126,7 @@ class HfTrainerKTConfig:
             return bool(explicit)
         # Default: when KTransformers is enabled, skip expert loading and expect a later KTransformers wrapper to load
         # experts from `kt_weight_path` or via on-the-fly conversion from checkpoint shards.
-        return True if self.enabled else False
+        return bool(self.enabled)
 
 
 def set_kt_config(kt_config: Any) -> None:

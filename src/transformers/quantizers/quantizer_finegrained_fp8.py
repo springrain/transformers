@@ -90,7 +90,7 @@ class FineGrainedFP8HfQuantizer(HfQuantizer):
     def param_element_size(self, model: "PreTrainedModel", param_name: str, param: "torch.Tensor") -> float:
         "Return the element size (in bytes) for `param_name`."
         if self.param_needs_quantization(model, param_name):
-            # 8 bit, this is neeed as when `pre_quantized`` is False, we don't set the dtype of the FP8Linear in order to correctly load the weights
+            # 8 bit, this is needed as when `pre_quantized`` is False, we don't set the dtype of the FP8Linear in order to correctly load the weights
             return 1
         return super().param_element_size(model, param_name, param)
 
@@ -120,12 +120,16 @@ class FineGrainedFP8HfQuantizer(HfQuantizer):
         model: "PreTrainedModel",
         **kwargs,
     ):
-        from ..integrations.finegrained_fp8 import replace_with_fp8_linear
+        from ..integrations.finegrained_fp8 import replace_with_fp8_embedding, replace_with_fp8_linear
 
         self._normalize_modules_to_not_convert(model)
         self.modules_to_not_convert = self.get_modules_to_not_convert(
             model, self.quantization_config.modules_to_not_convert, model._keep_in_fp32_modules
         )
+
+        modules_to_convert = self.quantization_config.modules_to_convert
+        if self.pre_quantized and modules_to_convert:
+            replace_with_fp8_embedding(model, modules_to_convert, self.modules_to_not_convert)
 
         model = replace_with_fp8_linear(
             model,
@@ -133,6 +137,33 @@ class FineGrainedFP8HfQuantizer(HfQuantizer):
             quantization_config=self.quantization_config,
             pre_quantized=self.pre_quantized,
         )
+
+    def _process_model_after_weight_loading(self, model, **kwargs):
+        # dsv4-flash-base stores its (power-of-two) ue8m0 scales in a float32 container under
+        # `.scale`; those renamed keys keep the on-disk float32 dtype, so cast them to the UE8M0
+        # dtype the kernels expect (exact, since the values are powers of two). Checkpoints that
+        # already ship the native float8 E8M0 dtype (e.g. dsv4-flash) are left untouched.
+        if self.quantization_config.scale_fmt == "ue8m0":
+            from ..integrations.finegrained_fp8 import _get_ue8m0_dtype
+
+            ue8m0 = _get_ue8m0_dtype()
+            float32_scales = [
+                name
+                for name, param in model.named_parameters()
+                if name.endswith("_scale_inv") and param.dtype == torch.float32
+            ]
+            for name in float32_scales:
+                module_name, _, attr = name.rpartition(".")
+                module = model.get_submodule(module_name)
+                scale = getattr(module, attr)
+                setattr(module, attr, torch.nn.Parameter(scale.data.to(ue8m0), requires_grad=False))
+
+        # Single-process multi-device is unsafe for DeepGEMM (its kernels are bound to one CUDA
+        # context); route those models through Triton/grouped_mm instead.
+        from ..integrations.finegrained_fp8 import _disable_deepgemm_on_multi_device
+
+        _disable_deepgemm_on_multi_device(model)
+        return model
 
     def update_tp_plan(self, config):
         if "Qwen3" in config.__class__.__name__:
@@ -155,20 +186,25 @@ class FineGrainedFP8HfQuantizer(HfQuantizer):
 
             config.base_model_tp_plan = text_plan
 
-        # Per-impl rewrite of the experts parallel-layer kind. Applied LAST so it composes
-        # on top of any plan written above (e.g. the Qwen3 dense plan). Models carry the
-        # experts mapping under `base_model_tp_plan` and/or `base_model_ep_plan` — rewrite
-        # both. See `FP8Experts._impl_tp_layer_overrides`.
         from ..integrations.finegrained_fp8 import FP8Experts
 
         impl = getattr(config, "_experts_implementation", None)
-        layer_overrides = FP8Experts._impl_tp_layer_overrides.get(impl)
-        if layer_overrides:
-            for plan_attr in ("base_model_tp_plan", "base_model_ep_plan"):
-                base_plan = getattr(config, plan_attr, None) or {}
-                updated_plan = {k: layer_overrides.get(v, v) for k, v in base_plan.items()}
-                if updated_plan != base_plan:
-                    setattr(config, plan_attr, updated_plan)
+        layer_overrides = FP8Experts._impl_tp_layer_overrides.get(impl, {})
+        for plan_attr in ("base_model_tp_plan", "base_model_ep_plan"):
+            base_plan = getattr(config, plan_attr, None) or {}
+            # Per-impl rewrite of the experts parallel-layer kind. Applied LAST so it composes
+            # on top of any plan written above (e.g. the Qwen3 dense plan). Models carry the
+            # experts mapping under `base_model_tp_plan` and/or `base_model_ep_plan` — rewrite
+            # both. See `FP8Experts._impl_tp_layer_overrides`.
+            updated_plan = {k: layer_overrides.get(v, v) for k, v in base_plan.items()}
+
+            # Expert scales must be sharded along with their corresponding weights.
+            for key, style in list(updated_plan.items()):
+                if style == "grouped_gemm":
+                    updated_plan.setdefault(f"{key}_scale_inv", style)
+
+            if updated_plan != base_plan:
+                setattr(config, plan_attr, updated_plan)
 
         return config
 
@@ -268,6 +304,14 @@ class FineGrainedFP8HfQuantizer(HfQuantizer):
         # loads scales as parameters, `dequantize=True` feeds them into `Fp8Dequantize`.
         scale_rename = WeightRenaming(source_patterns=r"^(.+)\.scale$", target_patterns=r"\1.weight_scale_inv")
         weight_conversions = [scale_rename] + list(weight_conversions)
+
+        # Some checkpoints shard weights (e.g. Qwen4-Exp's `ngram_embedding`). Since WeightConverter targets become source
+        # patterns when saving, anchor them to avoid matching the corresponding scale parameters.
+        for conv in weight_conversions:
+            if isinstance(conv, WeightConverter):
+                conv._original_target_patterns = [
+                    f"{p}$" if p.endswith(".weight") else p for p in conv._original_target_patterns
+                ]
 
         if not (self.pre_quantized and self.quantization_config.dequantize):
             if self.pre_quantized and self._is_mxfp8():

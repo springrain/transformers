@@ -68,7 +68,7 @@ class GraniteSpeechModelTester(ALMModelTester):
 
         super().__init__(parent, **kwargs)
 
-    def create_audio_features(self):
+    def create_audio_features(self, batch_size: int | None = None):
         # GraniteSpeech expects [B, seq_len, features] (time-first), unlike the standard [B, features, seq_len]
         return floats_tensor([self.batch_size, self.feat_seq_length, self.num_mel_bins])
 
@@ -154,10 +154,8 @@ class GraniteSpeechForConditionalGenerationModelTest(ALMModelTest, unittest.Test
             with torch.no_grad():
                 model(**inputs)
 
-    @pytest.mark.generate
-    @slow
-    @unittest.skip(reason="Granite Speech doesn't support SDPA for all backbones")
-    def test_eager_matches_sdpa_generate(self):
+    @unittest.skip(reason="ConformerAttention block forces MATH backend")
+    def test_sdpa_can_dispatch_on_flash(self):
         pass
 
 

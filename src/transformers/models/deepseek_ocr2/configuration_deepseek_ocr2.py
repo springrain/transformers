@@ -216,7 +216,7 @@ class DeepseekOcr2TextConfig(PreTrainedConfig):
         "norm": (["hidden_states"], ["hidden_states"]),
     }
 
-    vocab_size: int = 32000
+    vocab_size: int = 102400
     hidden_size: int = 4096
     intermediate_size: int = 11008
     num_hidden_layers: int = 32
@@ -237,8 +237,17 @@ class DeepseekOcr2TextConfig(PreTrainedConfig):
     attention_dropout: float | None = 0.0
     mlp_bias: bool = False
     head_dim: int | None = None
+    base_model_ep_plan = {
+        "layers.*.mlp.experts.gate_up_proj": "grouped_gemm",
+        "layers.*.mlp.experts.down_proj": "grouped_gemm",
+        "layers.*.mlp.experts": "ep_dispatch_experts",
+    }
+    attribute_map = {
+        "num_experts": "n_routed_experts",
+    }
     n_group: int | None = None
     n_routed_experts: int = 64
+    output_router_logits: bool = False
     n_shared_experts: int = 2
     routed_scaling_factor: float = 1.0
     topk_group: int | None = None
